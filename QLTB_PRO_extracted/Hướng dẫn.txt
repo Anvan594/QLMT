@@ -1,0 +1,2 @@
+build EXE
+C:\Users\IT\Desktop\thông kê pc\QLTB_PRO_extracted\QLTB_PRO_extracted>"C:\Users\IT\AppData\Local\Programs\Python\Python314\python.exe" -m PyInstaller --onefile --add-data "index.html;." --add-data "assets;assets" server.py
