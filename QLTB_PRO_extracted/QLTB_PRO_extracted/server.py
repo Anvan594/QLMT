@@ -742,15 +742,21 @@ def r_devices_import_template(m, body, qs):
         pos0 = conn.execute('SELECT * FROM positions WHERE dept_id=? ORDER BY name', (dept0['id'],)).fetchone() if dept0 else None
         grp0 = conn.execute('SELECT * FROM groups_tbl ORDER BY name').fetchone()
         typ0 = conn.execute('SELECT * FROM types_tbl WHERE group_id=? ORDER BY name', (grp0['id'],)).fetchone() if grp0 else None
+        
         headers = ['Mã tài sản (để trống để tự sinh)', 'Phòng/Ban *', 'Vị trí cụ thể *', 'Nhóm thiết bị *', 'Loại thiết bị *', 'Model', 'Hãng sản xuất', 'Số Serial', 'Cấu hình/Mô tả', 'Tình trạng', 'Ngày nhập kho (YYYY-MM-DD)', 'Ngày phân bổ (YYYY-MM-DD)', 'Số tháng/năm bảo hành', 'Đơn vị bảo hành (Tháng/Năm)', 'Nhà cung cấp', 'Giá trị (VNĐ)', 'Người sử dụng (họ tên)', 'Ghi chú']
-        example = ['', dept0['name'] if dept0 else 'Phòng Kế toán', pos0['name'] if pos0 else 'Phòng Kế toán', typ0['name'] if typ0 else 'Laptop', 'Dell Latitude 5420', 'Dell', 'SN123456', 'Core i5/8GB/256GB SSD', 'Bình thường', datetime.now().strftime('%Y-%m-%d'), '', '24', 'Tháng', 'Công ty ABC', '15000000', '', '']
+        
+        # Đã bổ sung đầy đủ 18 cột khớp hoàn toàn với headers (có grp0['name'] cho Nhóm thiết bị)
+        example = ['', dept0['name'] if dept0 else 'Văn phòng', pos0['name'] if pos0 else 'Nhân sự', grp0['name'] if grp0 else 'Thiết bị CNTT', typ0['name'] if typ0 else 'Máy tính', 'Dell Latitude 5420', 'Dell', 'SN123456', 'Core i5/8GB/256GB SSD', 'Bình thường', datetime.now().strftime('%Y-%m-%d'), '', '24', 'Tháng', 'Công ty ABC', '15000000', '', '']
+        
         dept_pos_pairs = _dept_pos_pairs(conn)
         group_type_pairs = _group_type_pairs(conn)
         user_names = [r['full_name'] for r in conn.execute('SELECT full_name FROM users ORDER BY full_name')]
+        
         ref_headers = ['Phòng/Ban', 'Vị trí cụ thể', 'Nhóm thiết bị', 'Loại thiết bị', 'Người dùng hiện có', 'Tình trạng hợp lệ']
         ref_rows = []
         for dp, gt, un, st in zip_longest(dept_pos_pairs, group_type_pairs, user_names, DEVICE_STATUS_OPTIONS, fillvalue=None):
             ref_rows.append([dp[0] if dp else '', dp[1] if dp else '', gt[0] if gt else '', gt[1] if gt else '', un or '', st or ''])
+            
         xlsx_bytes = build_xlsx([('Nhập thiết bị', headers, [example]), ('Danh mục tham khảo', ref_headers, ref_rows)])
     finally:
         conn.close()
@@ -758,45 +764,107 @@ def r_devices_import_template(m, body, qs):
 @route('POST', '/api/devices/import')
 @guard('devices', 'edit')
 def r_devices_import(m, body, qs):
-    b64=(body or {}).get('fileBase64') or ''
-    if not b64: return err('Vui lòng chọn file Excel để nhập')
-    try: rows=parse_xlsx_first_sheet(base64.b64decode(b64))
-    except Exception as e: return err(f'Không đọc được file Excel: {e}')
-    if len(rows)<2: return err('File Excel không có dữ liệu')
-    conn=get_db(); success=0; errors=[]
+    b64 = (body or {}).get('fileBase64') or ''
+    if not b64: 
+        return err('Vui lòng chọn file Excel để nhập')
+    try: 
+        rows = parse_xlsx_first_sheet(base64.b64decode(b64))
+    except Exception as e: 
+        return err(f'Không đọc được file Excel: {e}')
+    if len(rows) < 2: 
+        return err('File Excel không có dữ liệu')
+        
+    conn = get_db(); success = 0; errors = []
     try:
-        depts={(d['name'] or '').strip().lower():d for d in conn.execute('SELECT * FROM departments')}
-        pos={}
-        for r in conn.execute('SELECT * FROM positions'): pos[(r['dept_id'],(r['name'] or '').strip().lower())]=r
-        groups={(r['name'] or '').strip().lower():r for r in conn.execute('SELECT * FROM groups_tbl')}
-        types={}
-        for r in conn.execute('SELECT * FROM types_tbl'): types[(r['group_id'],(r['name'] or '').strip().lower())]=r
-        existing={(r['serial'] or '').strip().lower() for r in conn.execute('SELECT serial FROM devices') if r['serial']}
-        headers=rows[0]
-        idx={str(v).strip():i for i,v in enumerate(headers)}
-        def cell(row, name, fallback=None):
-            i=idx.get(name, fallback if fallback is not None else -1)
-            return str(row[i]).strip() if 0<=i<len(row) and row[i] is not None else ''
-        for n,row in enumerate(rows[1:],2):
-            dept=cell(row,'Phòng/Ban *',1); position=cell(row,'Vị trí cụ thể *',2); group=cell(row,'Nhóm thiết bị *',3); typ=cell(row,'Loại thiết bị *',4)
-            if not all([dept,position,group,typ]): errors.append(f'Dòng {n}: thiếu thông tin bắt buộc'); continue
-            d=depts.get(dept.lower()); g=groups.get(group.lower())
-            if not d: errors.append(f'Dòng {n}: không tìm thấy Phòng/Ban "{dept}"'); continue
-            if not g: errors.append(f'Dòng {n}: không tìm thấy Nhóm thiết bị "{group}"'); continue
-            ppos=pos.get((d['id'],position.lower())); t=types.get((g['id'],typ.lower()))
-            if not ppos: errors.append(f'Dòng {n}: không tìm thấy Vị trí "{position}"'); continue
-            if not t: errors.append(f'Dòng {n}: không tìm thấy Loại thiết bị "{typ}"'); continue
-            serial=cell(row,'Số Serial',7)
-            if serial and serial.lower() in existing: errors.append(f'Dòng {n}: Số Serial "{serial}" đã tồn tại'); continue
-            code=cell(row,'Mã tài sản (để trống để tự sinh)',0) or gen_asset_code(conn,typ)
-            conn.execute('INSERT INTO devices(id,asset_code,dept_id,pos_id,group_id,type_id,model,manufacturer,serial,config,status,import_date,allocate_date,warranty_months,warranty_unit,supplier,value,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(new_id(),code,d['id'],ppos['id'],g['id'],t['id'],cell(row,'Model',5),cell(row,'Hãng sản xuất',6),serial,cell(row,'Cấu hình/Mô tả',8),cell(row,'Tình trạng',9) or 'Bình thường',cell(row,'Ngày nhập kho (YYYY-MM-DD)',10),cell(row,'Ngày phân bổ (YYYY-MM-DD)',11),cell(row,'Số tháng/năm bảo hành',12),cell(row,'Đơn vị bảo hành (Tháng/Năm)',13),cell(row,'Nhà cung cấp',14),_parse_number_cell(cell(row,'Giá trị (VNĐ)',15)),cell(row,'Ghi chú',17),now_ms()))
-            if serial: existing.add(serial.lower())
-            success+=1
+        depts = {(d['name'] or '').strip().lower(): d for d in conn.execute('SELECT * FROM departments')}
+        pos = {}
+        for r in conn.execute('SELECT * FROM positions'): 
+            pos[(r['dept_id'], (r['name'] or '').strip().lower())] = r
+            
+        groups = {(r['name'] or '').strip().lower(): r for r in conn.execute('SELECT * FROM groups_tbl')}
+        types = {}
+        for r in conn.execute('SELECT * FROM types_tbl'): 
+            types[(r['group_id'], (r['name'] or '').strip().lower())] = r
+            
+        existing = {(r['serial'] or '').strip().lower() for r in conn.execute('SELECT serial FROM devices') if r['serial']}
+        
+        headers = [str(h).strip() for h in rows[0]]
+        col_map = {name: i for i, name in enumerate(headers)}
+        
+        def get_val(row_cells, col_name):
+            idx = col_map.get(col_name)
+            if idx is not None and idx < len(row_cells):
+                val = row_cells[idx]
+                return str(val).strip() if val is not None else ''
+            return ''
+
+        for n, row in enumerate(rows[1:], 2):
+            dept = get_val(row, 'Phòng/Ban *') or get_val(row, 'Phòng/Ban')
+            position = get_val(row, 'Vị trí cụ thể *') or get_val(row, 'Vị trí cụ thể')
+            group = get_val(row, 'Nhóm thiết bị *') or get_val(row, 'Nhóm thiết bị')
+            typ = get_val(row, 'Loại thiết bị *') or get_val(row, 'Loại thiết bị')
+            
+            if not all([dept, position, group, typ]): 
+                errors.append(f'Dòng {n}: thiếu thông tin bắt buộc (Phòng/Ban, Vị trí, Nhóm, Loại)')
+                continue
+                
+            d = depts.get(dept.lower())
+            g = groups.get(group.lower())
+            if not d: 
+                errors.append(f'Dòng {n}: không tìm thấy Phòng/Ban "{dept}"')
+                continue
+            if not g: 
+                errors.append(f'Dòng {n}: không tìm thấy Nhóm thiết bị "{group}"')
+                continue
+                
+            ppos = pos.get((d['id'], position.lower()))
+            t = types.get((g['id'], typ.lower()))
+            if not ppos: 
+                errors.append(f'Dòng {n}: không tìm thấy Vị trí "{position}" trong phòng ban "{dept}"')
+                continue
+            if not t: 
+                errors.append(f'Dòng {n}: không tìm thấy Loại thiết bị "{typ}" trong nhóm "{group}"')
+                continue
+                
+            serial = get_val(row, 'Số Serial')
+            if serial and serial.lower() in existing: 
+                errors.append(f'Dòng {n}: Số Serial "{serial}" đã tồn tại')
+                continue
+                
+            code = get_val(row, 'Mã tài sản (để trống để tự sinh)') or gen_asset_code(conn, typ)
+            
+            # Xử lý tìm ID người sử dụng nếu điền tên vào file Excel
+            user_name_input = get_val(row, 'Người sử dụng (họ tên)') or get_val(row, 'Người sử dụng')
+            user_id_val = ''
+            if user_name_input:
+                u_match = conn.execute('SELECT id FROM users WHERE LOWER(TRIM(full_name))=LOWER(?)', (user_name_input,)).fetchone()
+                if u_match:
+                    user_id_val = u_match['id']
+
+            conn.execute(
+                'INSERT INTO devices(id, asset_code, dept_id, pos_id, group_id, type_id, model, manufacturer, serial, config, status, import_date, allocate_date, warranty_months, warranty_unit, supplier, value, note, created_at, user_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (
+                    new_id(), code, d['id'], ppos['id'], g['id'], t['id'], 
+                    get_val(row, 'Model'), get_val(row, 'Hãng sản xuất'), serial, 
+                    get_val(row, 'Cấu hình/Mô tả'), get_val(row, 'Tình trạng') or 'Bình thường', 
+                    get_val(row, 'Ngày nhập kho (YYYY-MM-DD)'), get_val(row, 'Ngày phân bổ (YYYY-MM-DD)'), 
+                    get_val(row, 'Số tháng/năm bảo hành'), get_val(row, 'Đơn vị bảo hành (Tháng/Năm)'), 
+                    get_val(row, 'Nhà cung cấp'), _parse_number_cell(get_val(row, 'Giá trị (VNĐ)')), 
+                    get_val(row, 'Ghi chú'), now_ms(), user_id_val
+                )
+            )
+            if serial: 
+                existing.add(serial.lower())
+            success += 1
+            
         conn.commit()
     except Exception as e:
-        conn.rollback(); return err(f'Lỗi nhập dữ liệu: {e}',500)
-    finally: conn.close()
-    return (200,{'success':success,'errors':errors})
+        conn.rollback()
+        return err(f'Lỗi nhập dữ liệu: {e}', 500)
+    finally: 
+        conn.close()
+        
+    return (200, {'success': success, 'errors': errors})
 @route('POST', '/api/devices')
 @guard('devices', 'edit')
 def r_devices_create(m, body, qs):
@@ -2109,29 +2177,75 @@ def r_users_import_template(m, body, qs):
 @route('POST', '/api/users/import')
 @guard('users', 'edit')
 def r_users_import(m, body, qs):
-    b64=(body or {}).get('fileBase64') or ''
-    if not b64: return err('Vui lòng chọn file Excel để nhập')
-    try: rows=parse_xlsx_first_sheet(base64.b64decode(b64))
-    except Exception as e: return err(f'Không đọc được file Excel: {e}')
-    if len(rows)<2: return err('File Excel không có dữ liệu')
-    conn=get_db(); success=0; errors=[]
+    b64 = (body or {}).get('fileBase64') or ''
+    if not b64: 
+        return err('Vui lòng chọn file Excel để nhập')
+    try: 
+        rows = parse_xlsx_first_sheet(base64.b64decode(b64))
+    except Exception as e: 
+        return err(f'Không đọc được file Excel: {e}')
+    if len(rows) < 2: 
+        return err('File Excel không có dữ liệu')
+        
+    conn = get_db(); success = 0; errors = []
     try:
-        depts={(d['name'] or '').strip().lower():d for d in conn.execute('SELECT * FROM departments')}; pos={(r['dept_id'],(r['name'] or '').strip().lower()):r for r in conn.execute('SELECT * FROM positions')}
-        for n,row in enumerate(rows[1:],2):
-            def c(i): return str(row[i]).strip() if i<len(row) and row[i] is not None else ''
-            name=c(0)
-            if not name: continue
-            dept_id=pos_id=''; d=depts.get(c(1).lower()) if c(1) else None
-            if c(1) and not d: errors.append(f'Dòng {n}: không tìm thấy Phòng/Ban "{c(1)}"')
+        depts = {(d['name'] or '').strip().lower(): d for d in conn.execute('SELECT * FROM departments')}
+        pos = {(r['dept_id'], (r['name'] or '').strip().lower()): r for r in conn.execute('SELECT * FROM positions')}
+        
+        headers = [str(h).strip() for h in rows[0]]
+        # Lập bản đồ ánh xạ từ tên cột trong file Excel sang index của nó
+        col_map = {name: i for i, name in enumerate(headers)}
+        
+        def get_val(row_cells, col_name):
+            idx = col_map.get(col_name)
+            if idx is not None and idx < len(row_cells):
+                val = row_cells[idx]
+                return str(val).strip() if val is not None else ''
+            return ''
+
+        for n, row in enumerate(rows[1:], 2):
+            name = get_val(row, 'Họ và tên *') or get_val(row, 'Họ và tên')
+            if not name: 
+                continue
+                
+            dept_name = get_val(row, 'Phòng/Ban') or get_val(row, 'Phòng/Ban *')
+            pos_name = get_val(row, 'Vị trí cụ thể') or get_val(row, 'Vị trí cụ thể *')
+            position = get_val(row, 'Chức vụ / Vị trí công việc') or get_val(row, 'Chức vụ')
+            email = get_val(row, 'Email')
+            phone = get_val(row, 'Điện thoại')
+            note = get_val(row, 'Ghi chú')
+            
+            dept_id = ''
+            pos_id = ''
+            d = depts.get(dept_name.lower()) if dept_name else None
+            
+            if dept_name and not d: 
+                errors.append(f'Dòng {n}: không tìm thấy Phòng/Ban "{dept_name}"')
+                continue
             elif d:
-                dept_id=d['id']; pr=pos.get((dept_id,c(2).lower())) if c(2) else None
-                if c(2) and not pr: errors.append(f'Dòng {n}: không tìm thấy Vị trí "{c(2)}"')
-                elif pr: pos_id=pr['id']
-            conn.execute('INSERT INTO users(id,full_name,email,phone,dept_id,pos_id,position,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(new_id(),name,c(4),c(5),dept_id,pos_id,c(3),c(6),now_ms())); success+=1
+                dept_id = d['id']
+                if pos_name:
+                    pr = pos.get((dept_id, pos_name.lower()))
+                    if not pr:
+                        errors.append(f'Dòng {n}: không tìm thấy Vị trí "{pos_name}" trong phòng ban "{dept_name}"')
+                        continue
+                    else:
+                        pos_id = pr['id']
+                        
+            conn.execute(
+                'INSERT INTO users(id, full_name, email, phone, dept_id, pos_id, position, note, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                (new_id(), name, email, phone, dept_id, pos_id, position, note, now_ms())
+            )
+            success += 1
+            
         conn.commit()
-    except Exception as e: conn.rollback(); return err(f'Lỗi nhập người dùng: {e}',500)
-    finally: conn.close()
-    return (200,{'success':success,'total':len(rows)-1,'errors':errors})
+    except Exception as e: 
+        conn.rollback()
+        return err(f'Lỗi nhập người dùng: {e}', 500)
+    finally: 
+        conn.close()
+        
+    return (200, {'success': success, 'total': len(rows)-1, 'errors': errors})
 @route('GET', '/api/users')
 @guard('users', 'view')
 def r_users_list(m, body, qs):
